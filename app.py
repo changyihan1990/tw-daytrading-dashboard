@@ -164,7 +164,7 @@ with tab2:
             st.dataframe(
                 df_score.style.format(
                     {"綜合評分": "{:.0f}", "漲跌幅(%)": "{:.2f}", "振幅(%)": "{:.2f}", "量能倍數": "{:.1f}x"}
-                ).applymap(_style_change, subset=["漲跌幅(%)"]),
+                ).map(_style_change, subset=["漲跌幅(%)"]),
                 use_container_width=True,
                 hide_index=True,
             )
