@@ -1,159 +1,164 @@
 """
-app.py
-台股當沖觀察儀表板 —— 本機 Streamlit 網頁儀表板
+analysis.py
+個股技術分析核心邏輯：頸線型態辨識、壓力/支撐區（成交量分布）、當日量能預估。
 
-執行方式：
-    streamlit run app.py
-
-資料來源：Yahoo Finance（透過 yfinance 套件），延遲約 15-20 分鐘，僅供技術面觀察參考，非投資建議。
+這裡的演算法都是「簡化版」的統計啟發式規則，目的是先讓系統能動起來、看得到標記，
+之後你可以依照自己的交易邏輯調整參數（例如 order、bins、lookback）或替換成更嚴謹的演算法。
 """
-
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
+from scipy.signal import argrelextrema
 import yfinance as yf
 
-from analysis import compute_vwap, detect_neckline, estimate_full_day_volume, volume_profile_zones
-from data_sources import get_market_snapshot
 
-st.set_page_config(page_title="台股當沖觀察儀表板", layout="wide")
+def find_troughs_peaks(df, order=5):
+    """用局部極值找出波峰(peak)與波谷(trough)的索引位置"""
+    close = df["Close"].values
+    peak_idx = argrelextrema(close, np.greater, order=order)[0]
+    trough_idx = argrelextrema(close, np.less, order=order)[0]
+    return peak_idx, trough_idx
 
-st.title("台股當沖觀察儀表板")
-st.caption(
-    f"資料來源：Yahoo Finance（延遲資料，僅供參考，非投資建議）　|　"
-    f"頁面產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-)
 
-# ============================================================
-# 一、盤前全球市場總覽
-# ============================================================
-st.header("一、盤前全球市場總覽")
-st.caption("建議觀察順序：美股收盤 → 美股期貨(隔夜走勢) → 日韓股市開盤 → 台幣匯率 → 台股/台指期開盤")
+def detect_neckline(df, order=5, lookback=60):
+    """
+    偵測近期是否有雙重頂/底或頭肩頂/底型態，並回傳對應的頸線價位。
 
-with st.spinner("讀取全球市場資料中..."):
-    snapshot = get_market_snapshot()
+    邏輯：
+    - 底部型態：找兩個相近的低點，中間夾一個反彈高點 -> 頸線 = 反彈高點價位
+    - 頭部型態：找兩個相近的高點，中間夾一個回檔低點 -> 頸線 = 回檔低點價位
 
-cols = st.columns(5)
-for i, item in enumerate(snapshot):
-    col = cols[i % 5]
-    with col:
-        if "error" in item or item.get("last") is None:
-            st.metric(item["name"], "資料取得失敗")
-        else:
-            delta = f"{item['change_pct']:.2f}%" if item["change_pct"] is not None else None
-            st.metric(item["name"], f"{item['last']:.2f}", delta)
+    回傳: {"type": str|None, "points": dict|None}
+    """
+    recent = df.tail(lookback).reset_index(drop=True)
+    if len(recent) < order * 3:
+        return {"type": None, "points": None}
 
-st.info(
-    "台指期（TX）目前沒有可靠的免費即時 API，上方「台灣加權指數」只能作為方向性參考，"
-    "正式判斷開盤走勢請搭配你的券商看盤軟體或期交所公開資訊觀測站。"
-)
+    peak_idx, trough_idx = find_troughs_peaks(recent, order=order)
 
-st.divider()
+    # 底部型態
+    if len(trough_idx) >= 2 and len(peak_idx) >= 1:
+        t1, t2 = trough_idx[-2], trough_idx[-1]
+        mid_peaks = [p for p in peak_idx if t1 < p < t2]
+        if mid_peaks:
+            neck_idx = mid_peaks[-1]
+            neck_price = float(recent["High"].iloc[neck_idx])
+            return {
+                "type": "底部型態（雙重底/頭肩底）",
+                "points": {
+                    "neck_index": int(neck_idx),
+                    "price": neck_price,
+                    "troughs": [
+                        (int(t1), float(recent["Low"].iloc[t1])),
+                        (int(t2), float(recent["Low"].iloc[t2])),
+                    ],
+                },
+            }
 
-# ============================================================
-# 二、個股技術分析
-# ============================================================
-st.header("二、個股技術分析")
+    # 頭部型態
+    if len(peak_idx) >= 2 and len(trough_idx) >= 1:
+        p1, p2 = peak_idx[-2], peak_idx[-1]
+        mid_troughs = [t for t in trough_idx if p1 < t < p2]
+        if mid_troughs:
+            neck_idx = mid_troughs[-1]
+            neck_price = float(recent["Low"].iloc[neck_idx])
+            return {
+                "type": "頭部型態（雙重頂/頭肩頂）",
+                "points": {
+                    "neck_index": int(neck_idx),
+                    "price": neck_price,
+                    "peaks": [
+                        (int(p1), float(recent["High"].iloc[p1])),
+                        (int(p2), float(recent["High"].iloc[p2])),
+                    ],
+                },
+            }
 
-col_a, col_b, col_c = st.columns(3)
-with col_a:
-    ticker_input = st.text_input("股票代號（上市加 .TW，上櫃加 .TWO）", value="2330.TW")
-with col_b:
-    period = st.selectbox("資料區間", ["5d", "1mo", "3mo", "6mo"], index=1)
-with col_c:
-    interval = st.selectbox("K線週期", ["1d", "1h", "30m", "5m"], index=0)
+    return {"type": None, "points": None}
 
-if ticker_input:
+
+def volume_profile_zones(df, bins=24, top_n=3):
+    """
+    用成交量分布（Volume Profile）找出壓力/支撐區間：
+    把價格切成 N 個區間，統計每個區間累積成交量，取成交量最大的前 top_n 個區間視為主要壓力/支撐區。
+    """
+    work = df.copy()
+    price_min, price_max = float(work["Low"].min()), float(work["High"].max())
+    if price_max <= price_min:
+        return []
+
+    bin_edges = np.linspace(price_min, price_max, bins + 1)
+    work["mid_price"] = (work["High"] + work["Low"]) / 2
+    work["bin"] = pd.cut(work["mid_price"], bins=bin_edges, include_lowest=True)
+
+    vol_by_bin = work.groupby("bin", observed=True)["Volume"].sum().sort_values(ascending=False)
+
+    zones = []
+    for interval in vol_by_bin.index[:top_n]:
+        zones.append({
+            "low": float(interval.left),
+            "high": float(interval.right),
+            "volume": float(vol_by_bin[interval]),
+        })
+    return zones
+
+
+def estimate_full_day_volume(ticker, current_cum_volume, current_time_str, days=10):
+    """
+    用「時間比例法」預估全日成交量：
+    抓取過去 N 個交易日的 5 分鐘K線，計算「到目前這個時間點為止的累積量」佔「當日全天總量」的平均比例，
+    再用今日目前的累積量反推預估全日量。
+
+    :param ticker: yfinance 股票代號，例如 '2330.TW'
+    :param current_cum_volume: 今日截至目前的累積成交量
+    :param current_time_str: 'HH:MM' 格式的目前時間，例如 '09:30'
+    :param days: 用過去幾個交易日的資料來建立時間比例基準
+    """
     try:
-        df = yf.download(ticker_input, period=period, interval=interval, progress=False)
-    except Exception as e:
-        df = pd.DataFrame()
-        st.error(f"資料下載失敗：{e}")
+        hist = yf.download(ticker, period=f"{days}d", interval="5m", progress=False)
+    except Exception:
+        return None
 
-    if df.empty:
-        st.error("查無資料，請確認股票代號格式（例如台積電為 2330.TW）")
-    else:
-        # yfinance 新版下載單一股票有時仍會回傳多層欄位索引(MultiIndex)，
-        # 例如 ('High', '2330.TW')，這裡統一把它扁平化成一般欄位，避免後面計算出錯
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
+    if hist.empty:
+        return None
 
-        # ---- K線圖 ----
-        fig = go.Figure(
-            data=[
-                go.Candlestick(
-                    x=df.index,
-                    open=df["Open"],
-                    high=df["High"],
-                    low=df["Low"],
-                    close=df["Close"],
-                    name="K線",
-                )
-            ]
-        )
+    # 同樣處理 yfinance 新版可能回傳的 MultiIndex 欄位
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = hist.columns.get_level_values(0)
 
-        # ---- 頸線標記 ----
-        neckline = detect_neckline(df)
-        if neckline["type"]:
-            neck_price = neckline["points"]["price"]
-            fig.add_hline(
-                y=neck_price,
-                line_dash="dash",
-                line_color="orange",
-                annotation_text=f"頸線：{neckline['type']}",
-                annotation_position="top left",
-            )
+    if hist.index.tz is not None:
+        hist = hist.tz_localize(None)
 
-        # ---- 壓力/支撐區 ----
-        zones = volume_profile_zones(df)
-        for z in zones:
-            fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor="LightSalmon", opacity=0.25, line_width=0)
+    hist = hist.copy()
+    hist["date"] = hist.index.date
+    hist["time"] = hist.index.strftime("%H:%M")
 
-        # ---- VWAP（僅在分鐘級資料時顯示較有意義）----
-        if interval in ("5m", "30m", "1h"):
-            vwap = compute_vwap(df)
-            fig.add_trace(go.Scatter(x=df.index, y=vwap, name="VWAP", line=dict(color="blue", width=1)))
+    ratios = []
+    for _, group in hist.groupby("date"):
+        full_day_vol = group["Volume"].sum()
+        if full_day_vol <= 0:
+            continue
+        cum_at_time = group[group["time"] <= current_time_str]["Volume"].sum()
+        if cum_at_time > 0:
+            ratios.append(cum_at_time / full_day_vol)
 
-        fig.update_layout(height=600, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+    if not ratios:
+        return None
 
-        # ---- 文字說明：頸線 ----
-        if neckline["type"]:
-            st.write(f"辨識到型態：**{neckline['type']}**，頸線價位約 **{neckline['points']['price']:.2f}**")
-        else:
-            st.write("目前資料未辨識出明顯的雙重頂/底或頭肩型態（可調整K線週期或資料區間再觀察）")
+    avg_ratio = float(np.mean(ratios))
+    if avg_ratio <= 0:
+        return None
 
-        # ---- 文字說明：壓力/支撐 ----
-        st.subheader("壓力／支撐區間（依成交量分布推算）")
-        if zones:
-            for z in sorted(zones, key=lambda x: x["low"]):
-                st.write(f"- {z['low']:.2f} ~ {z['high']:.2f}　（區間成交量權重：{z['volume']:,.0f}）")
-        else:
-            st.write("資料不足，暫時無法計算壓力/支撐區")
+    estimated_full_day = current_cum_volume / avg_ratio
+    return {
+        "avg_ratio": avg_ratio,
+        "estimated_full_day_volume": estimated_full_day,
+        "sample_days": len(ratios),
+    }
 
-        # ---- 今日量能預估 ----
-        st.subheader("今日量能預估")
-        if interval in ("5m", "30m", "1h"):
-            current_time_str = datetime.now().strftime("%H:%M")
-            current_cum_vol = float(df["Volume"].sum())
-            est = estimate_full_day_volume(ticker_input, current_cum_vol, current_time_str)
-            if est:
-                st.write(
-                    f"依過去 {est['sample_days']} 個交易日同時段的量能比例"
-                    f"（約 {est['avg_ratio'] * 100:.1f}%）推算："
-                )
-                st.write(f"預估今日全日成交量約為 **{est['estimated_full_day_volume']:,.0f}** 股")
-            else:
-                st.write("歷史分鐘資料不足，暫時無法估算全日量")
-        else:
-            st.write("請將「K線週期」切換為 5m / 30m / 1h，才能估算當日累積量與全日量")
 
-st.divider()
-st.caption(
-    "本系統僅為技術面觀察工具，所有標記（頸線、壓力/支撐區、量能預估）皆為統計推論，不構成任何投資建議。"
-    "當沖交易風險極高，請自行評估風險，並確認你的券商當沖資格與相關規則後再進行實際交易。"
-)
+def compute_vwap(df):
+    """計算成交量加權平均價 VWAP，用來判斷股價偏離度"""
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+    vwap = (typical_price * df["Volume"]).cumsum() / df["Volume"].cumsum()
+    return vwap
