@@ -122,6 +122,10 @@ def estimate_full_day_volume(ticker, current_cum_volume, current_time_str, days=
     if hist.empty:
         return None
 
+    # 同樣處理 yfinance 新版可能回傳的 MultiIndex 欄位
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = hist.columns.get_level_values(0)
+
     if hist.index.tz is not None:
         hist = hist.tz_localize(None)
 
