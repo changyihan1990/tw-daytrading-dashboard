@@ -1,65 +1,159 @@
-# 台股當沖觀察儀表板
+"""
+app.py
+台股當沖觀察儀表板 —— 本機 Streamlit 網頁儀表板
 
-本機執行的 Streamlit 網頁儀表板，整合「盤前全球市場總覽」與「個股技術分析」。
+執行方式：
+    streamlit run app.py
 
-## 檔案說明
+資料來源：Yahoo Finance（透過 yfinance 套件），延遲約 15-20 分鐘，僅供技術面觀察參考，非投資建議。
+"""
 
-- `app.py` — 主程式，啟動網頁儀表板
-- `data_sources.py` — 抓取美股收盤、美股期貨、日韓開盤、台幣匯率等全球市場資料
-- `analysis.py` — 頸線偵測、壓力/支撐區（成交量分布）、量能預估、VWAP 計算
-- `requirements.txt` — 所需的 Python 套件清單
+from datetime import datetime
 
-## 安裝與執行（在你自己的電腦上）
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
 
-這個系統需要連上網路抓取即時報價，請在你自己有網路連線的電腦上執行，**不是**在這個對話的沙盒環境裡跑。
+from analysis import compute_vwap, detect_neckline, estimate_full_day_volume, volume_profile_zones
+from data_sources import get_market_snapshot
 
-```bash
-# 1. 建議先建立虛擬環境（可選）
-python3 -m venv venv
-source venv/bin/activate      # Windows 用 venv\Scripts\activate
+st.set_page_config(page_title="台股當沖觀察儀表板", layout="wide")
 
-# 2. 安裝套件
-pip install -r requirements.txt
+st.title("台股當沖觀察儀表板")
+st.caption(
+    f"資料來源：Yahoo Finance（延遲資料，僅供參考，非投資建議）　|　"
+    f"頁面產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+)
 
-# 3. 啟動儀表板
-streamlit run app.py
-```
+# ============================================================
+# 一、盤前全球市場總覽
+# ============================================================
+st.header("一、盤前全球市場總覽")
+st.caption("建議觀察順序：美股收盤 → 美股期貨(隔夜走勢) → 日韓股市開盤 → 台幣匯率 → 台股/台指期開盤")
 
-啟動後會自動在瀏覽器開啟一個網頁（通常是 http://localhost:8501）。
+with st.spinner("讀取全球市場資料中..."):
+    snapshot = get_market_snapshot()
 
-## 功能說明
+cols = st.columns(5)
+for i, item in enumerate(snapshot):
+    col = cols[i % 5]
+    with col:
+        if "error" in item or item.get("last") is None:
+            st.metric(item["name"], "資料取得失敗")
+        else:
+            delta = f"{item['change_pct']:.2f}%" if item["change_pct"] is not None else None
+            st.metric(item["name"], f"{item['last']:.2f}", delta)
 
-### 一、盤前全球市場總覽
-顯示美股三大指數（道瓊/S&P500/那斯達克）、美股期貨（YM/ES/NQ）、日經225、南韓KOSPI、
-台灣加權指數、美元兌台幣匯率的最新價與漲跌幅，並依「美股收盤 → 美期貨走勢 → 日韓開盤 →
-台幣匯率 → 台股開盤」的順序排列，方便你依觀察習慣一次掃過。
+st.info(
+    "台指期（TX）目前沒有可靠的免費即時 API，上方「台灣加權指數」只能作為方向性參考，"
+    "正式判斷開盤走勢請搭配你的券商看盤軟體或期交所公開資訊觀測站。"
+)
 
-**已知限制**：台指期（TX 期貨）目前沒有可靠、免費、穩定的公開 API，儀表板用「台灣加權指數」
-作為方向性替代參考。如果你有券商期貨帳戶，建議正式交易前務必用券商的看盤軟體核對。
+st.divider()
 
-### 二、個股技術分析
-輸入股票代號（例如台積電 `2330.TW`，上櫃股票用 `.TWO`），選擇資料區間與K線週期：
+# ============================================================
+# 二、個股技術分析
+# ============================================================
+st.header("二、個股技術分析")
 
-- **K線圖**：Plotly 繪製的可互動蠟燭圖
-- **頸線**：用局部極值演算法（`scipy.signal.argrelextrema`）偵測雙重頂/底或頭肩頂/底型態，
-  自動標示頸線價位
-- **壓力/支撐區**：用成交量分布（Volume Profile）找出歷史成交量最集中的價格區間
-- **量能預估**：切換到 5m/30m/1h 週期後，用「時間比例法」比對過去交易日同時段的累積量比例，
-  推算今日全日成交量
-- **VWAP**：分鐘級資料下額外疊圖，方便觀察股價偏離均價的程度
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    ticker_input = st.text_input("股票代號（上市加 .TW，上櫃加 .TWO）", value="2330.TW")
+with col_b:
+    period = st.selectbox("資料區間", ["5d", "1mo", "3mo", "6mo"], index=1)
+with col_c:
+    interval = st.selectbox("K線週期", ["1d", "1h", "30m", "5m"], index=0)
 
-## 之後可以擴充的方向
+if ticker_input:
+    try:
+        df = yf.download(ticker_input, period=period, interval=interval, progress=False)
+    except Exception as e:
+        df = pd.DataFrame()
+        st.error(f"資料下載失敗：{e}")
 
-1. **接上券商即時 API**：把 `data_sources.py` 裡的 yfinance 換成你的券商 API（例如元大/富邦/永豐），
-   拿到真正即時的報價與委買委賣資料，而不是 Yahoo 的延遲資料。
-2. **告警通知**：在 `app.py` 裡加入判斷式，當股價突破頸線或觸及壓力/支撐區時，
-   透過 Line Notify 或 Telegram Bot 主動推播。
-3. **多股同時監控**：把單一股票輸入改成清單，用迴圈批次跑分析，做成一個總覽表格。
-4. **回測**：把 `analysis.py` 的訊號邏輯接上歷史資料，統計勝率與期望值，
-   評估這套規則是否值得實際使用。
+    if df.empty:
+        st.error("查無資料，請確認股票代號格式（例如台積電為 2330.TW）")
+    else:
+        # yfinance 新版下載單一股票有時仍會回傳多層欄位索引(MultiIndex)，
+        # 例如 ('High', '2330.TW')，這裡統一把它扁平化成一般欄位，避免後面計算出錯
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
 
-## 重要提醒
+        # ---- K線圖 ----
+        fig = go.Figure(
+            data=[
+                go.Candlestick(
+                    x=df.index,
+                    open=df["Open"],
+                    high=df["High"],
+                    low=df["Low"],
+                    close=df["Close"],
+                    name="K線",
+                )
+            ]
+        )
 
-本系統的所有標記（頸線、壓力/支撐、量能預估）都是統計推論，**不是投資建議**。
-Yahoo Finance 屬延遲資料，不適合作為當沖下單的即時依據。當沖交易風險極高，
-請先確認自己的券商當沖資格與規則，並建議先以模擬單驗證一段時間再考慮實際交易。
+        # ---- 頸線標記 ----
+        neckline = detect_neckline(df)
+        if neckline["type"]:
+            neck_price = neckline["points"]["price"]
+            fig.add_hline(
+                y=neck_price,
+                line_dash="dash",
+                line_color="orange",
+                annotation_text=f"頸線：{neckline['type']}",
+                annotation_position="top left",
+            )
+
+        # ---- 壓力/支撐區 ----
+        zones = volume_profile_zones(df)
+        for z in zones:
+            fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor="LightSalmon", opacity=0.25, line_width=0)
+
+        # ---- VWAP（僅在分鐘級資料時顯示較有意義）----
+        if interval in ("5m", "30m", "1h"):
+            vwap = compute_vwap(df)
+            fig.add_trace(go.Scatter(x=df.index, y=vwap, name="VWAP", line=dict(color="blue", width=1)))
+
+        fig.update_layout(height=600, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ---- 文字說明：頸線 ----
+        if neckline["type"]:
+            st.write(f"辨識到型態：**{neckline['type']}**，頸線價位約 **{neckline['points']['price']:.2f}**")
+        else:
+            st.write("目前資料未辨識出明顯的雙重頂/底或頭肩型態（可調整K線週期或資料區間再觀察）")
+
+        # ---- 文字說明：壓力/支撐 ----
+        st.subheader("壓力／支撐區間（依成交量分布推算）")
+        if zones:
+            for z in sorted(zones, key=lambda x: x["low"]):
+                st.write(f"- {z['low']:.2f} ~ {z['high']:.2f}　（區間成交量權重：{z['volume']:,.0f}）")
+        else:
+            st.write("資料不足，暫時無法計算壓力/支撐區")
+
+        # ---- 今日量能預估 ----
+        st.subheader("今日量能預估")
+        if interval in ("5m", "30m", "1h"):
+            current_time_str = datetime.now().strftime("%H:%M")
+            current_cum_vol = float(df["Volume"].sum())
+            est = estimate_full_day_volume(ticker_input, current_cum_vol, current_time_str)
+            if est:
+                st.write(
+                    f"依過去 {est['sample_days']} 個交易日同時段的量能比例"
+                    f"（約 {est['avg_ratio'] * 100:.1f}%）推算："
+                )
+                st.write(f"預估今日全日成交量約為 **{est['estimated_full_day_volume']:,.0f}** 股")
+            else:
+                st.write("歷史分鐘資料不足，暫時無法估算全日量")
+        else:
+            st.write("請將「K線週期」切換為 5m / 30m / 1h，才能估算當日累積量與全日量")
+
+st.divider()
+st.caption(
+    "本系統僅為技術面觀察工具，所有標記（頸線、壓力/支撐區、量能預估）皆為統計推論，不構成任何投資建議。"
+    "當沖交易風險極高，請自行評估風險，並確認你的券商當沖資格與相關規則後再進行實際交易。"
+)
