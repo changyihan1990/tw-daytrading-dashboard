@@ -76,6 +76,10 @@ if ticker_input:
     if df.empty:
         st.error("查無資料，請確認股票代號格式（例如台積電為 2330.TW）")
     else:
+        # yfinance 新版下載單一股票有時仍會回傳多層欄位索引(MultiIndex)，
+        # 例如 ('High', '2330.TW')，這裡統一把它扁平化成一般欄位，避免後面計算出錯
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         df = df.dropna()
 
         # ---- K線圖 ----
