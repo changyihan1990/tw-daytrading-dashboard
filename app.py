@@ -179,7 +179,7 @@ with tab2:
             st.dataframe(
                 df_vol.style.format(
                     {"今日成交量(股)": "{:,.0f}", "漲跌幅(%)": "{:.2f}", "成交金額(約)": "{:,.0f}"}
-                ).applymap(_style_change, subset=["漲跌幅(%)"]),
+                ).map(_style_change, subset=["漲跌幅(%)"]),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -193,7 +193,7 @@ with tab2:
         st.dataframe(
             df_rel.style.format(
                 {"量能倍數": "{:.1f}x", "漲跌幅(%)": "{:.2f}", "振幅(%)": "{:.2f}"}
-            ).applymap(_style_change, subset=["漲跌幅(%)"]),
+            ).map(_style_change, subset=["漲跌幅(%)"]),
             use_container_width=True,
             hide_index=True,
         )
