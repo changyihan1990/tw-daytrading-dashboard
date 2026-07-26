@@ -17,7 +17,13 @@ import streamlit as st
 import yfinance as yf
 
 from analysis import compute_vwap, detect_neckline, estimate_full_day_volume, volume_profile_zones
-from data_sources import get_market_snapshot
+from data_sources import get_hot_day_trading_candidates, get_market_snapshot
+
+# 分鐘級資料的判斷用得到好幾次，統一寫在這裡方便維護
+MINUTE_INTERVALS = ("1m", "5m", "30m", "1h")
+
+# 快取熱門候選股計算結果 5 分鐘，避免每次頁面互動都重新抓資料、變超慢
+_get_hot_candidates_cached = st.cache_data(ttl=300)(get_hot_day_trading_candidates)
 
 st.set_page_config(page_title="台股當沖觀察儀表板", layout="wide")
 
@@ -58,13 +64,51 @@ st.divider()
 # ============================================================
 st.header("二、個股技術分析")
 
+st.subheader("今日熱門當沖候選股")
+st.caption(
+    "依「今日成交量 ÷ 過去20日均量」的倍數排序，近似抓出量能異常放大的股票。"
+    "這不是官方即時當沖排行榜（免費資料源沒有這個），只是輔助篩選參考，實際交易請自行確認成交量與籌碼狀況。"
+)
+
+with st.spinner("計算熱門候選股中..."):
+    hot_list = _get_hot_candidates_cached()
+
+NO_SELECTION_LABEL = "-- 不使用清單，自行輸入代號 --"
+hot_options = [NO_SELECTION_LABEL] + [
+    f"{item['name']}（{item['symbol']}）量能倍數 {item['relative_volume']:.1f}x"
+    for item in hot_list
+]
+
+if "ticker_input" not in st.session_state:
+    st.session_state["ticker_input"] = "2330.TW"
+if "last_hot_choice" not in st.session_state:
+    st.session_state["last_hot_choice"] = NO_SELECTION_LABEL
+
+default_index = (
+    hot_options.index(st.session_state["last_hot_choice"])
+    if st.session_state["last_hot_choice"] in hot_options
+    else 0
+)
+hot_choice = st.selectbox("選擇今日熱門候選股", hot_options, index=default_index)
+
+if hot_choice != st.session_state["last_hot_choice"]:
+    st.session_state["last_hot_choice"] = hot_choice
+    if hot_choice != NO_SELECTION_LABEL:
+        chosen = hot_list[hot_options.index(hot_choice) - 1]
+        st.session_state["ticker_input"] = chosen["symbol"]
+    st.rerun()
+
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    ticker_input = st.text_input("股票代號（上市加 .TW，上櫃加 .TWO）", value="2330.TW")
+    ticker_input = st.text_input("股票代號（上市加 .TW，上櫃加 .TWO）", key="ticker_input")
 with col_b:
-    period = st.selectbox("資料區間", ["5d", "1mo", "3mo", "6mo"], index=1)
+    period = st.selectbox("資料區間", ["1d", "5d", "1mo", "3mo", "6mo"], index=2)
 with col_c:
-    interval = st.selectbox("K線週期", ["1d", "1h", "30m", "5m"], index=0)
+    interval = st.selectbox("K線週期", ["1d", "1h", "30m", "5m", "1m"], index=0)
+
+if interval == "1m" and period not in ("1d", "5d"):
+    period = "1d"
+    st.caption("已自動把資料區間改為「1d」，因為 Yahoo Finance 的 1 分鐘K線最多只提供最近幾天的資料。")
 
 if ticker_input:
     try:
@@ -81,6 +125,8 @@ if ticker_input:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna()
+
+        st.caption(f"目前顯示：{ticker_input}｜資料區間 {period}｜K線週期 {interval}")
 
         # ---- K線圖 ----
         fig = go.Figure(
@@ -114,7 +160,7 @@ if ticker_input:
             fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor="LightSalmon", opacity=0.25, line_width=0)
 
         # ---- VWAP（僅在分鐘級資料時顯示較有意義）----
-        if interval in ("5m", "30m", "1h"):
+        if interval in MINUTE_INTERVALS:
             vwap = compute_vwap(df)
             fig.add_trace(go.Scatter(x=df.index, y=vwap, name="VWAP", line=dict(color="blue", width=1)))
 
@@ -137,7 +183,7 @@ if ticker_input:
 
         # ---- 今日量能預估 ----
         st.subheader("今日量能預估")
-        if interval in ("5m", "30m", "1h"):
+        if interval in MINUTE_INTERVALS:
             current_time_str = datetime.now().strftime("%H:%M")
             current_cum_vol = float(df["Volume"].sum())
             est = estimate_full_day_volume(ticker_input, current_cum_vol, current_time_str)
@@ -150,7 +196,7 @@ if ticker_input:
             else:
                 st.write("歷史分鐘資料不足，暫時無法估算全日量")
         else:
-            st.write("請將「K線週期」切換為 5m / 30m / 1h，才能估算當日累積量與全日量")
+            st.write("請將「K線週期」切換為 1m / 5m / 30m / 1h，才能估算當日累積量與全日量")
 
 st.divider()
 st.caption(
