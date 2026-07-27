@@ -162,3 +162,48 @@ def compute_vwap(df):
     typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
     vwap = (typical_price * df["Volume"]).cumsum() / df["Volume"].cumsum()
     return vwap
+
+
+def compute_rsi(df, period=14):
+    """
+    計算 RSI 相對強弱指標（0~100）。
+    常見判讀：RSI > 70 視為超買、RSI < 30 視為超賣，但個股特性不同，這只是參考區間。
+    """
+    close = df["Close"]
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)  # 資料不足時先給中性值50，避免圖表一開頭就斷掉
+
+
+def compute_macd(df, fast=12, slow=26, signal=9):
+    """
+    計算 MACD 指標，回傳 (macd_line, signal_line, histogram)。
+    常見判讀：MACD 由下往上穿過訊號線是「黃金交叉」（偏多訊號），反之是「死亡交叉」（偏空訊號）。
+    """
+    close = df["Close"]
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def compute_gap_info(df):
+    """
+    計算跳空缺口：最新一根K棒的開盤價，相較前一根收盤價的百分比變化。
+    當沖常用來判斷「開盤跳空」是否有機會延續或回補，回傳 None 代表資料不足。
+    """
+    if len(df) < 2:
+        return None
+    prev_close = float(df["Close"].iloc[-2])
+    latest_open = float(df["Open"].iloc[-1])
+    if prev_close <= 0:
+        return None
+    gap_pct = (latest_open - prev_close) / prev_close * 100
+    return {"prev_close": prev_close, "latest_open": latest_open, "gap_pct": gap_pct}
