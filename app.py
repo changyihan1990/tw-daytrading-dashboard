@@ -14,8 +14,17 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
 
-from analysis import compute_vwap, detect_neckline, estimate_full_day_volume, volume_profile_zones
+from analysis import (
+    compute_gap_info,
+    compute_macd,
+    compute_rsi,
+    compute_vwap,
+    detect_neckline,
+    estimate_full_day_volume,
+    volume_profile_zones,
+)
 from data_sources import (
     ASIAN_CONVENTION_NAMES,
     compute_day_trading_scores,
@@ -43,6 +52,16 @@ def _style_change(val):
     if v < 0:
         return "color: #1e8449; font-weight: 600;"
     return ""
+
+
+def _apply_cell_style(styler, func, subset):
+    """
+    新版 pandas（2.1+）把 Styler.applymap 換成 Styler.map，舊版 pandas 還是只有 applymap。
+    這裡自動判斷用哪一個，避免因為 pandas 版本不同而炸掉。
+    """
+    if hasattr(styler, "map"):
+        return styler.map(func, subset=subset)
+    return styler.applymap(func, subset=subset)
 
 
 st.set_page_config(page_title="台股當沖觀察儀表板", layout="wide", page_icon="📈")
@@ -104,7 +123,7 @@ with tab1:
     st.info(
         "台指期（TX）目前沒有可靠的免費即時 API，「台灣加權指數」只能作為方向性參考，"
         "正式判斷開盤走勢請搭配你的券商看盤軟體或期交所公開資訊觀測站。　"
-        "（台灣加權指數／日經／KOSPI 採紅漲綠跌的亞洲慣例，美股維持國際慣例綠漲紅跌）"
+        "（台灣加權指數／櫃買指數／日經／KOSPI 採紅漲綠跌的亞洲慣例，美股維持國際慣例綠漲紅跌）"
     )
 
 # ============================================================
@@ -164,7 +183,7 @@ with tab2:
             st.dataframe(
                 df_score.style.format(
                     {"綜合評分": "{:.0f}", "漲跌幅(%)": "{:.2f}", "振幅(%)": "{:.2f}", "量能倍數": "{:.1f}x"}
-                ).map(_style_change, subset=["漲跌幅(%)"]),
+                ).pipe(_apply_cell_style, _style_change, ["漲跌幅(%)"]),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -179,7 +198,7 @@ with tab2:
             st.dataframe(
                 df_vol.style.format(
                     {"今日成交量(股)": "{:,.0f}", "漲跌幅(%)": "{:.2f}", "成交金額(約)": "{:,.0f}"}
-                ).map(_style_change, subset=["漲跌幅(%)"]),
+                ).pipe(_apply_cell_style, _style_change, ["漲跌幅(%)"]),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -193,7 +212,7 @@ with tab2:
         st.dataframe(
             df_rel.style.format(
                 {"量能倍數": "{:.1f}x", "漲跌幅(%)": "{:.2f}", "振幅(%)": "{:.2f}"}
-            ).map(_style_change, subset=["漲跌幅(%)"]),
+            ).pipe(_apply_cell_style, _style_change, ["漲跌幅(%)"]),
             use_container_width=True,
             hide_index=True,
         )
@@ -232,20 +251,18 @@ with tab3:
 
             st.caption(f"目前顯示：{ticker_input}｜資料區間 {period}｜K線週期 {interval}")
 
-            # ---- K線圖 ----
-            fig = go.Figure(
-                data=[
-                    go.Candlestick(
-                        x=df.index,
-                        open=df["Open"],
-                        high=df["High"],
-                        low=df["Low"],
-                        close=df["Close"],
-                        name="K線",
-                        increasing_line_color="#c0392b",
-                        decreasing_line_color="#1e8449",
-                    )
-                ]
+            # ---- 三層子圖：價格K線 / 成交量 / MACD ----
+            fig = make_subplots(
+                rows=3, cols=1, shared_xaxes=True,
+                row_heights=[0.55, 0.18, 0.27], vertical_spacing=0.03,
+            )
+
+            fig.add_trace(
+                go.Candlestick(
+                    x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+                    name="K線", increasing_line_color="#c0392b", decreasing_line_color="#1e8449",
+                ),
+                row=1, col=1,
             )
 
             # ---- 頸線標記 ----
@@ -253,25 +270,88 @@ with tab3:
             if neckline["type"]:
                 neck_price = neckline["points"]["price"]
                 fig.add_hline(
-                    y=neck_price,
-                    line_dash="dash",
-                    line_color="orange",
-                    annotation_text=f"頸線：{neckline['type']}",
-                    annotation_position="top left",
+                    y=neck_price, line_dash="dash", line_color="orange",
+                    annotation_text=f"頸線：{neckline['type']}", annotation_position="top left",
+                    row=1, col=1,
                 )
 
             # ---- 壓力/支撐區 ----
             zones = volume_profile_zones(df)
             for z in zones:
-                fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor="LightSalmon", opacity=0.25, line_width=0)
+                fig.add_hrect(
+                    y0=z["low"], y1=z["high"], fillcolor="LightSalmon", opacity=0.25, line_width=0,
+                    row=1, col=1,
+                )
 
             # ---- VWAP（僅在分鐘級資料時顯示較有意義）----
             if interval in MINUTE_INTERVALS:
                 vwap = compute_vwap(df)
-                fig.add_trace(go.Scatter(x=df.index, y=vwap, name="VWAP", line=dict(color="blue", width=1)))
+                fig.add_trace(
+                    go.Scatter(x=df.index, y=vwap, name="VWAP", line=dict(color="blue", width=1)),
+                    row=1, col=1,
+                )
 
-            fig.update_layout(height=600, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
+            # ---- 成交量柱狀圖（紅漲綠跌）----
+            vol_colors = [
+                "#c0392b" if c >= o else "#1e8449"
+                for o, c in zip(df["Open"], df["Close"])
+            ]
+            fig.add_trace(
+                go.Bar(x=df.index, y=df["Volume"], name="成交量", marker_color=vol_colors, showlegend=False),
+                row=2, col=1,
+            )
+
+            # ---- MACD ----
+            macd_line, signal_line, histogram = compute_macd(df)
+            hist_colors = ["#c0392b" if v >= 0 else "#1e8449" for v in histogram]
+            fig.add_trace(
+                go.Bar(x=df.index, y=histogram, name="MACD柱", marker_color=hist_colors, showlegend=False),
+                row=3, col=1,
+            )
+            fig.add_trace(
+                go.Scatter(x=df.index, y=macd_line, name="MACD", line=dict(color="#2980b9", width=1.3)),
+                row=3, col=1,
+            )
+            fig.add_trace(
+                go.Scatter(x=df.index, y=signal_line, name="訊號線", line=dict(color="#f39c12", width=1.3)),
+                row=3, col=1,
+            )
+
+            fig.update_layout(
+                height=720, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+            )
+            fig.update_yaxes(title_text="價格", row=1, col=1)
+            fig.update_yaxes(title_text="成交量", row=2, col=1)
+            fig.update_yaxes(title_text="MACD", row=3, col=1)
             st.plotly_chart(fig, use_container_width=True)
+
+            # ---- RSI 與跳空缺口 ----
+            rsi_series = compute_rsi(df)
+            latest_rsi = float(rsi_series.iloc[-1])
+            rsi_label = "超買區" if latest_rsi > 70 else ("超賣區" if latest_rsi < 30 else "中性")
+            gap_info = compute_gap_info(df)
+
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            with metric_col1:
+                st.metric("RSI(14)", f"{latest_rsi:.1f}", rsi_label, delta_color="off")
+            with metric_col2:
+                if gap_info:
+                    st.metric(
+                        "跳空缺口(%)", f"{gap_info['gap_pct']:.2f}%",
+                        "向上跳空" if gap_info["gap_pct"] > 0 else ("向下跳空" if gap_info["gap_pct"] < 0 else "無缺口"),
+                        delta_color="inverse",
+                    )
+                else:
+                    st.metric("跳空缺口(%)", "資料不足")
+            with metric_col3:
+                macd_state = "黃金交叉區間" if macd_line.iloc[-1] > signal_line.iloc[-1] else "死亡交叉區間"
+                st.metric("MACD狀態", macd_state)
+
+            st.caption(
+                "RSI、MACD、跳空缺口都是從既有的價量資料計算出來的技術指標，僅供參考，"
+                "不是買賣訊號，且不同股票的合理區間可能不同。"
+            )
 
             col_left, col_right = st.columns(2)
 
@@ -313,7 +393,7 @@ with tab3:
 # ============================================================
 with tab4:
     st.caption(
-        "彙整自《理財達人秀 EBCmoneyshow》YouTube頻道（東森財經台製作）的最新影片標題與連結，"
+        "彙整自《理財達人秀 EBCmoneyshow》YouTube頻道（東森財經台製作）的最新影片標題、說明文字與連結，"
         "純粹整理呈現，不代表本系統認同其分析或個股推薦。節目本身也聲明「與分析師所推介個股無不當之財務利益關係，"
         "資料僅供參考」，投資決策請自行獨立判斷。"
     )
@@ -334,15 +414,16 @@ with tab4:
                 if v["mentioned_stocks"]:
                     parts = []
                     for m in v["mentioned_stocks"]:
-                        tag = "  ⭐今日當沖評分前15名" if m["symbol"] in top15_symbols else ""
-                        parts.append(f"{m['name']}（{m['symbol']}）{tag}")
-                    st.write("🔎 標題提及候選股：" + "、".join(parts))
+                        star = "⭐" if m["symbol"] in top15_symbols else ""
+                        parts.append(f"{m['name']}（{m['symbol']}，{m['source']}）{star}")
+                    st.write("🔎 內容中提及的股票：" + "、".join(parts))
                 else:
-                    st.write("🔎 標題中未比對到候選股清單內的個股")
+                    st.write("🔎 標題與說明中未偵測到明確的股票名稱或代號")
 
         st.caption(
-            "「標題提及候選股」只是簡單的文字比對（標題裡有沒有出現候選股清單中的公司名稱），"
-            "不是語意分析，標題沒提到不代表節目沒討論，提到也不代表是明確的買賣建議。"
+            "「內容中提及的股票」是從標題+說明文字裡比對候選股清單的公司名稱，"
+            "或抓出文字中的4~5位數字比對台股代號（不在候選清單的代號會嘗試用Yahoo查詢名稱）。"
+            "這只是文字/代號比對，不是語意分析，⭐代表同時也在今日當沖評分前15名。"
         )
 
 st.divider()
