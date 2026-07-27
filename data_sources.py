@@ -8,6 +8,9 @@ data_sources.py
   正式交易請務必搭配券商看盤軟體或台灣期貨交易所公開資訊觀測站進行比對，不要只依賴這裡的數字。
 """
 
+from datetime import datetime
+
+import re
 import yfinance as yf
 
 try:
@@ -26,12 +29,13 @@ GLOBAL_TICKERS = {
     "日經225": "^N225",
     "南韓KOSPI": "^KS11",
     "台灣加權指數": "^TWII",
+    "櫃買指數": "^TWOII",
     "美元兌台幣": "TWD=X",
 }
 
 # 亞洲市場慣例是「紅漲綠跌」，跟美股「綠漲紅跌」相反。
 # 這個清單裡的項目在畫面上會用亞洲慣例顯示顏色，其餘（美股/美期貨/匯率）維持國際慣例。
-ASIAN_CONVENTION_NAMES = {"日經225", "南韓KOSPI", "台灣加權指數"}
+ASIAN_CONVENTION_NAMES = {"日經225", "南韓KOSPI", "台灣加權指數", "櫃買指數"}
 
 
 # 候選股清單：常見的高流動性、常被當沖交易的台股，涵蓋半導體、航運、金融、傳產等主要族群
@@ -89,41 +93,98 @@ CANDIDATE_UNIVERSE = {
 }
 
 
+def _taipei_today():
+    """回傳台北時區的今天日期，用來判斷日K的最後一列是不是「今天」"""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Taipei")).date()
+    except Exception:
+        return datetime.utcnow().date()
+
+
 def get_candidate_metrics():
     """
-    一次抓取候選股清單的近2個月日K資料，計算後續排行/評分需要的各項指標：
-    - today_volume：今日成交量（股）
+    抓取候選股清單的指標，用兩組資料組合出「盡量貼近即時」的當日狀況：
+    - 日K資料（近3個月）：用來算過去20日均量、昨收，當基準
+    - 當日分鐘級資料（5分鐘K，period=1d）：用來算「到目前為止」的今日累積量、當日最高最低、目前價格
+
+    這樣即使現在是盤中，排行也能反映開盤後到目前的即時量價變化，而不是卡在昨天的日K上不動。
+    如果分鐘級資料抓不到（例如還沒開盤、假日），會退回用日K的今日列，都沒有的話視為量能0、價格持平。
+
+    回傳的欄位：
+    - today_volume：今日累積成交量（股）
     - relative_volume：今日成交量 / 過去20日均量（量能倍數）
     - amplitude_pct：今日振幅 = (今日最高 - 今日最低) / 昨收 * 100
-    - turnover：約略成交金額 = 今日成交量 * 今日收盤價
-    - change_pct：今日漲跌幅
+    - turnover：約略成交金額 = 今日成交量 * 目前價格
+    - change_pct：目前價格相較昨收的漲跌幅
 
-    回傳: list[dict]，未排序（排序交給呼叫端依需求決定用哪個欄位排序）
+    回傳: list[dict]，未排序
     """
     tickers = list(CANDIDATE_UNIVERSE.values())
+
     try:
-        data = yf.download(tickers, period="2mo", interval="1d", progress=False, group_by="ticker")
+        daily = yf.download(tickers, period="3mo", interval="1d", progress=False, group_by="ticker")
     except Exception:
         return []
 
+    try:
+        intraday = yf.download(tickers, period="1d", interval="5m", progress=False, group_by="ticker")
+    except Exception:
+        intraday = None
+
+    today = _taipei_today()
     results = []
+
     for name, symbol in CANDIDATE_UNIVERSE.items():
         try:
-            sub = data[symbol].dropna()
-            if len(sub) < 21:
+            daily_sub = daily[symbol].dropna()
+            if len(daily_sub) < 21:
                 continue
 
-            today = sub.iloc[-1]
-            prev_close = float(sub["Close"].iloc[-2])
-            today_volume = float(today["Volume"])
-            avg_vol_20 = float(sub["Volume"].iloc[-21:-1].mean())
-            if avg_vol_20 <= 0 or prev_close <= 0:
+            last_idx = daily_sub.index[-1]
+            last_date = last_idx.date() if hasattr(last_idx, "date") else last_idx
+            is_today_row = last_date == today
+
+            # 20日均量跟昨收都要排除「今天」這一列（如果今天已經在日K裡了），避免用到還在更新中的資料
+            history = daily_sub.iloc[:-1] if is_today_row else daily_sub
+            if len(history) < 20:
                 continue
+
+            prev_close = float(history["Close"].iloc[-1])
+            avg_vol_20 = float(history["Volume"].iloc[-20:].mean())
+            if prev_close <= 0 or avg_vol_20 <= 0:
+                continue
+
+            today_volume = today_high = today_low = today_close = None
+
+            # 優先用分鐘級資料反映「到目前為止」的即時狀況
+            if intraday is not None:
+                try:
+                    intraday_sub = intraday[symbol].dropna()
+                    if not intraday_sub.empty:
+                        today_volume = float(intraday_sub["Volume"].sum())
+                        today_high = float(intraday_sub["High"].max())
+                        today_low = float(intraday_sub["Low"].min())
+                        today_close = float(intraday_sub["Close"].iloc[-1])
+                except Exception:
+                    pass
+
+            # 分鐘級資料抓不到，退回用日K的今日列
+            if today_volume is None and is_today_row:
+                today_row = daily_sub.iloc[-1]
+                today_volume = float(today_row["Volume"])
+                today_high = float(today_row["High"])
+                today_low = float(today_row["Low"])
+                today_close = float(today_row["Close"])
+
+            # 兩邊都沒有（例如還沒開盤），視為量能0、價格持平在昨收
+            if today_volume is None:
+                today_volume, today_high, today_low, today_close = 0.0, prev_close, prev_close, prev_close
 
             relative_volume = today_volume / avg_vol_20
-            turnover = today_volume * float(today["Close"])
-            amplitude_pct = (float(today["High"]) - float(today["Low"])) / prev_close * 100
-            change_pct = (float(today["Close"]) - prev_close) / prev_close * 100
+            turnover = today_volume * today_close
+            amplitude_pct = (today_high - today_low) / prev_close * 100
+            change_pct = (today_close - prev_close) / prev_close * 100
 
             results.append({
                 "name": name,
@@ -230,19 +291,79 @@ EBC_MONEYSHOW_CHANNEL_ID = "UCQvsuaih5lE0n_Ne54nNezg"
 EBC_MONEYSHOW_RSS_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={EBC_MONEYSHOW_CHANNEL_ID}"
 
 
-def _extract_mentioned_stocks(text):
+# 台股代號常見是4位數字（部分ETF是5位數字，例如00919），拿掉看起來像年份的數字，減少誤判
+_STOCK_CODE_PATTERN = re.compile(r"(?<!\d)\d{4,5}(?!\d)")
+_YEAR_LIKE_NUMBERS = {str(y) for y in range(2015, 2036)}
+
+# 代號查名稱有查詢次數上限，避免一支影片裡出現太多不認識的代號時拖慢速度
+_MAX_UNKNOWN_CODE_LOOKUPS = 3
+
+
+def _lookup_stock_name_by_code(code):
+    """用 yfinance 查詢股票代號對應的公司名稱（例如 5410 -> 國眾），查不到就回傳 None"""
+    for suffix in (".TW", ".TWO"):
+        try:
+            info = yf.Ticker(f"{code}{suffix}").info
+            name = info.get("shortName") or info.get("longName")
+            if name:
+                return name
+        except Exception:
+            continue
+    return None
+
+
+def extract_mentioned_stocks_from_text(text):
     """
-    用簡單的字串比對，看候選股清單裡的公司名稱有沒有出現在影片標題裡，
-    藉此標出「本集標題可能提到哪些候選股」。這只是文字比對，不是語意分析，僅供參考，
-    標題沒提到不代表節目沒討論，標題提到也不代表是明確買賣建議。
+    從一段文字（例如影片標題+說明）裡，直接找出可能提到的股票，不限於候選股清單：
+
+    1. 先看候選股清單的公司名稱有沒有直接出現在文字裡
+    2. 再用正規表達式抓出文字裡的4~5位數字（台股代號常見格式），排除看起來像年份的數字
+       - 如果代號剛好對到候選股清單，直接標記名稱
+       - 不在候選清單的代號，改用 yfinance 查詢公司名稱（有查詢次數上限）
+
+    這只是文字/代號比對，不是語意分析，僅供參考，標題沒提到不代表節目沒討論，
+    提到也不代表是明確的買賣建議。
+
+    回傳: list[dict]，每個 {"name":..., "symbol":..., "source": "候選清單"|"代號比對"}
     """
     if not text:
         return []
-    return [
-        {"name": name, "symbol": symbol}
-        for name, symbol in CANDIDATE_UNIVERSE.items()
-        if name in text
-    ]
+
+    found = {}
+
+    for name, symbol in CANDIDATE_UNIVERSE.items():
+        if name in text:
+            found[symbol] = {"name": name, "symbol": symbol, "source": "候選清單"}
+
+    code_to_symbol = {v.split(".")[0]: v for v in CANDIDATE_UNIVERSE.values()}
+    symbol_to_name = {v: k for k, v in CANDIDATE_UNIVERSE.items()}
+
+    codes = {m for m in _STOCK_CODE_PATTERN.findall(text) if m not in _YEAR_LIKE_NUMBERS}
+    unknown_lookup_count = 0
+
+    for code in codes:
+        if code in code_to_symbol:
+            symbol = code_to_symbol[code]
+            if symbol not in found:
+                found[symbol] = {"name": symbol_to_name[symbol], "symbol": symbol, "source": "候選清單"}
+            continue
+
+        symbol_guess = f"{code}.TW"
+        if symbol_guess in found:
+            continue
+
+        if unknown_lookup_count >= _MAX_UNKNOWN_CODE_LOOKUPS:
+            found[symbol_guess] = {"name": f"代號 {code}（未查詢名稱）", "symbol": symbol_guess, "source": "代號比對"}
+            continue
+
+        unknown_lookup_count += 1
+        name = _lookup_stock_name_by_code(code)
+        if name:
+            found[symbol_guess] = {"name": name, "symbol": symbol_guess, "source": "代號比對"}
+        else:
+            found[symbol_guess] = {"name": f"代號 {code}（查無資料）", "symbol": symbol_guess, "source": "代號比對"}
+
+    return list(found.values())
 
 
 def get_ebc_moneyshow_videos(max_results=10):
@@ -268,10 +389,12 @@ def get_ebc_moneyshow_videos(max_results=10):
         title = getattr(entry, "title", "")
         link = getattr(entry, "link", "")
         published = getattr(entry, "published", "")
+        description = getattr(entry, "summary", "")
+        combined_text = f"{title} {description}"
         videos.append({
             "title": title,
             "link": link,
             "published": published,
-            "mentioned_stocks": _extract_mentioned_stocks(title),
+            "mentioned_stocks": extract_mentioned_stocks_from_text(combined_text),
         })
     return videos
