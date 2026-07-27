@@ -6,17 +6,29 @@ data_sources.py
 - Yahoo Finance 資料通常有 15-20 分鐘延遲，且部分商品（尤其是期貨）在非交易時段可能沒有即時報價。
 - 台指期（TX 期貨）目前沒有可靠、免費、穩定的公開 API，此檔案用「台灣加權指數 ^TWII」作為替代參考，
   正式交易請務必搭配券商看盤軟體或台灣期貨交易所公開資訊觀測站進行比對，不要只依賴這裡的數字。
+- 櫃買指數（^TWOII）經實測後確認：這個代號只存在於 Yahoo「台灣站」（tw.stock.yahoo.com），
+  Yahoo 的「國際版」後端（finance.yahoo.com，也就是 yfinance 套件實際抓資料的地方）查這個代號會是 404，
+  代表這不是程式碼寫法的問題，是免費的 yfinance 從源頭就拿不到這筆資料，所以這裡沒有加這個指數。
+  如果之後想看櫃買指數，建議直接看 Yahoo奇摩股市或券商看盤軟體。
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import re
+
+import pandas as pd
 import yfinance as yf
 
 try:
     import feedparser
 except ImportError:
     feedparser = None
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+except ImportError:
+    YouTubeTranscriptApi = None
 
 # 觀察順序建議：美股收盤 -> 美股期貨(隔夜) -> 日韓開盤 -> 台幣匯率 -> 台股/台指期開盤
 GLOBAL_TICKERS = {
@@ -29,13 +41,12 @@ GLOBAL_TICKERS = {
     "日經225": "^N225",
     "南韓KOSPI": "^KS11",
     "台灣加權指數": "^TWII",
-    "櫃買指數": "^TWOII",
     "美元兌台幣": "TWD=X",
 }
 
 # 亞洲市場慣例是「紅漲綠跌」，跟美股「綠漲紅跌」相反。
 # 這個清單裡的項目在畫面上會用亞洲慣例顯示顏色，其餘（美股/美期貨/匯率）維持國際慣例。
-ASIAN_CONVENTION_NAMES = {"日經225", "南韓KOSPI", "台灣加權指數", "櫃買指數"}
+ASIAN_CONVENTION_NAMES = {"日經225", "南韓KOSPI", "台灣加權指數"}
 
 
 # 候選股清單：常見的高流動性、常被當沖交易的台股，涵蓋半導體、航運、金融、傳產等主要族群
@@ -102,14 +113,52 @@ def _taipei_today():
         return datetime.utcnow().date()
 
 
+def _fetch_intraday_single(symbol):
+    """
+    抓單一股票「當日」的5分鐘K資料，回傳今日累積量/最高/最低/目前價，抓不到回傳 None。
+    刻意一次只抓一檔，不跟其他股票一起批次抓，避免 Yahoo 對大量批次分鐘資料請求限流，
+    導致整批失敗（這是先前「當沖排行沒有即時反映開盤現狀」的主因）。
+    """
+    try:
+        df = yf.download(symbol, period="1d", interval="5m", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+        if df.empty:
+            return None
+        return {
+            "volume": float(df["Volume"].sum()),
+            "high": float(df["High"].max()),
+            "low": float(df["Low"].min()),
+            "close": float(df["Close"].iloc[-1]),
+        }
+    except Exception:
+        return None
+
+
+def _fetch_all_intraday(symbols, max_workers=8):
+    """用多執行緒平行抓取每檔股票的當日分鐘資料，比逐一序列抓取快很多，且互不影響"""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_fetch_intraday_single, s): s for s in symbols}
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                results[symbol] = future.result()
+            except Exception:
+                results[symbol] = None
+    return results
+
+
 def get_candidate_metrics():
     """
     抓取候選股清單的指標，用兩組資料組合出「盡量貼近即時」的當日狀況：
-    - 日K資料（近3個月）：用來算過去20日均量、昨收，當基準
-    - 當日分鐘級資料（5分鐘K，period=1d）：用來算「到目前為止」的今日累積量、當日最高最低、目前價格
+    - 日K資料（近3個月，一次批次抓）：用來算過去20日均量、昨收，當基準
+    - 當日分鐘級資料（5分鐘K，逐檔個別平行抓取）：用來算「到目前為止」的今日累積量、當日最高最低、目前價格
 
-    這樣即使現在是盤中，排行也能反映開盤後到目前的即時量價變化，而不是卡在昨天的日K上不動。
-    如果分鐘級資料抓不到（例如還沒開盤、假日），會退回用日K的今日列，都沒有的話視為量能0、價格持平。
+    分鐘級資料改成逐檔個別抓取（而不是像日K一樣整批一次抓），是因為 Yahoo 對大量股票的
+    分鐘級批次請求容易限流，導致整批失敗、所有股票都退回「量能0、價格持平」，
+    這樣排行看起來就會像完全沒有變動。逐檔個別抓取搭配多執行緒平行處理，較不會整批一起壞掉。
 
     回傳的欄位：
     - today_volume：今日累積成交量（股）
@@ -127,10 +176,7 @@ def get_candidate_metrics():
     except Exception:
         return []
 
-    try:
-        intraday = yf.download(tickers, period="1d", interval="5m", progress=False, group_by="ticker")
-    except Exception:
-        intraday = None
+    intraday_map = _fetch_all_intraday(tickers)
 
     today = _taipei_today()
     results = []
@@ -157,17 +203,12 @@ def get_candidate_metrics():
 
             today_volume = today_high = today_low = today_close = None
 
-            # 優先用分鐘級資料反映「到目前為止」的即時狀況
-            if intraday is not None:
-                try:
-                    intraday_sub = intraday[symbol].dropna()
-                    if not intraday_sub.empty:
-                        today_volume = float(intraday_sub["Volume"].sum())
-                        today_high = float(intraday_sub["High"].max())
-                        today_low = float(intraday_sub["Low"].min())
-                        today_close = float(intraday_sub["Close"].iloc[-1])
-                except Exception:
-                    pass
+            intraday_data = intraday_map.get(symbol)
+            if intraday_data:
+                today_volume = intraday_data["volume"]
+                today_high = intraday_data["high"]
+                today_low = intraday_data["low"]
+                today_close = intraday_data["close"]
 
             # 分鐘級資料抓不到，退回用日K的今日列
             if today_volume is None and is_today_row:
@@ -244,26 +285,18 @@ def compute_day_trading_scores(metrics):
 def get_market_snapshot():
     """
     抓取上述所有商品的最新價與漲跌幅（相較前一筆收盤）。
+    逐一個別抓取（而不是一次批次抓全部），避免其中一項資料有問題時，
+    影響到其他商品的日期索引對齊（不同市場的交易日曆本來就不一樣，混在一起批次抓容易出錯）。
+
     回傳: list[dict]，每個 dict 包含 name / symbol / last / change_pct 或 error
     """
-    tickers = list(GLOBAL_TICKERS.values())
     snapshot = []
-
-    try:
-        data = yf.download(
-            tickers, period="5d", interval="1d",
-            progress=False, group_by="ticker", auto_adjust=False,
-        )
-    except Exception as e:
-        return [{"name": name, "symbol": symbol, "error": str(e)}
-                for name, symbol in GLOBAL_TICKERS.items()]
-
     for name, symbol in GLOBAL_TICKERS.items():
         try:
-            if len(tickers) == 1:
-                close = data["Close"].dropna()
-            else:
-                close = data[symbol]["Close"].dropna()
+            hist = yf.download(symbol, period="5d", interval="1d", progress=False, auto_adjust=False)
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = hist.columns.get_level_values(0)
+            close = hist["Close"].dropna()
 
             if len(close) >= 2:
                 last = float(close.iloc[-1])
@@ -366,11 +399,47 @@ def extract_mentioned_stocks_from_text(text):
     return list(found.values())
 
 
-def get_ebc_moneyshow_videos(max_results=10):
-    """
-    抓取《理財達人秀 EBCmoneyshow》YouTube頻道的最新影片清單。
+_VIDEO_ID_PATTERN = re.compile(r"v=([A-Za-z0-9_-]{11})")
 
-    回傳: list[dict]，每筆包含 title / link / published / mentioned_stocks
+
+def _extract_video_id(entry, link):
+    """從RSS條目或影片連結中取出YouTube影片ID"""
+    vid = getattr(entry, "yt_videoid", None)
+    if vid:
+        return vid
+    match = _VIDEO_ID_PATTERN.search(link or "")
+    return match.group(1) if match else None
+
+
+def get_video_transcript_text(video_id):
+    """
+    抓取YouTube影片的字幕內容（通常是自動生成字幕），把所有片段串接成一段完整文字。
+    這才是真正的「影片內容」，而不只是標題或說明欄位。
+
+    如果影片沒有開放字幕、字幕被關閉，或套件沒安裝，回傳 None，呼叫端要自行退回用標題/說明分析。
+    """
+    if YouTubeTranscriptApi is None or not video_id:
+        return None
+    for languages in (["zh-Hant", "zh-TW"], ["zh-Hans", "zh-CN", "zh"], ["en"]):
+        try:
+            segments = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+            text = " ".join(seg.get("text", "") for seg in segments)
+            if text.strip():
+                return text
+        except Exception:
+            continue
+    return None
+
+
+def get_ebc_moneyshow_videos(max_results=10, use_transcript=True):
+    """
+    抓取《理財達人秀 EBCmoneyshow》YouTube頻道的最新影片清單，並分析每支影片「內容」提到的股票。
+
+    分析優先順序：
+    1. 如果抓得到字幕（YouTube自動字幕），優先用字幕全文分析，這才是真正的「影片內容」
+    2. 字幕抓不到（該影片沒開字幕、字幕被關閉等），退回只用標題+說明文字分析
+
+    回傳: list[dict]，每筆包含 title / link / published / used_transcript / mentioned_stocks
     若抓取失敗（網路問題、feedparser 未安裝等）回傳空清單，呼叫端要自行處理空清單的顯示。
     """
     if feedparser is None:
@@ -390,11 +459,20 @@ def get_ebc_moneyshow_videos(max_results=10):
         link = getattr(entry, "link", "")
         published = getattr(entry, "published", "")
         description = getattr(entry, "summary", "")
-        combined_text = f"{title} {description}"
+
+        transcript_text = None
+        if use_transcript:
+            video_id = _extract_video_id(entry, link)
+            transcript_text = get_video_transcript_text(video_id)
+
+        used_transcript = bool(transcript_text)
+        combined_text = " ".join(filter(None, [title, description, transcript_text]))
+
         videos.append({
             "title": title,
             "link": link,
             "published": published,
+            "used_transcript": used_transcript,
             "mentioned_stocks": extract_mentioned_stocks_from_text(combined_text),
         })
     return videos
