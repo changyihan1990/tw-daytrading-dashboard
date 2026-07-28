@@ -30,6 +30,8 @@ from data_sources import (
     compute_day_trading_scores,
     get_candidate_metrics,
     get_ebc_moneyshow_videos,
+    get_institutional_streaks,
+    get_institutional_top10,
     get_market_snapshot,
 )
 
@@ -39,6 +41,10 @@ MINUTE_INTERVALS = ("1m", "5m", "30m", "1h")
 _get_candidate_metrics_cached = st.cache_data(ttl=300)(get_candidate_metrics)
 # 影片清單快取久一點（30分鐘），因為節目不會每幾分鐘就更新一支新影片
 _get_ebc_videos_cached = st.cache_data(ttl=1800)(get_ebc_moneyshow_videos)
+# 法人買賣超前10名快取30分鐘（資料通常收盤後才更新一次）
+_get_institutional_top10_cached = st.cache_data(ttl=1800)(get_institutional_top10)
+# 連續買賣超需要抓約25個交易日的資料，比較耗時，快取久一點（2小時）
+_get_institutional_streaks_cached = st.cache_data(ttl=7200)(get_institutional_streaks)
 
 
 def _style_change(val):
@@ -91,8 +97,8 @@ st.caption(
     f"頁面產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🌏 盤前總覽", "🔥 熱門/當沖評分排行", "📊 個股技術分析", "📺 理財達人秀彙整"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🌏 盤前總覽", "🔥 熱門/當沖評分排行", "📊 個股技術分析", "📺 理財達人秀彙整", "💰 法人籌碼"]
 )
 
 # 候選股指標只算一次，讓「熱門排行」跟「理財達人秀彙整」分頁共用（交叉比對用得到）
@@ -428,6 +434,92 @@ with tab4:
             "比對方式是候選股清單的公司名稱，或文字中的4~5位數字比對台股代號（不在候選清單的代號會嘗試用Yahoo查詢名稱）。"
             "這只是文字/代號比對，不是語意分析，⭐代表同時也在今日當沖評分前15名。"
         )
+
+# ============================================================
+# Tab 5：法人籌碼
+# ============================================================
+with tab5:
+    st.caption(
+        "資料來源：證交所「三大法人買賣超日報(T86)」官方報表，僅涵蓋上市（TWSE）股票，不含上櫃。"
+        "遇到假日或連假會自動往前找最近一個有資料的交易日。"
+    )
+
+    with st.spinner("讀取三大法人買賣超資料中..."):
+        top10 = _get_institutional_top10_cached()
+
+    if not top10:
+        st.error("目前無法取得三大法人資料，可能是連續假日、網路問題，或證交所暫停服務")
+    else:
+        display_date = f"{top10['date'][:4]}/{top10['date'][4:6]}/{top10['date'][6:]}"
+        st.subheader(f"📅 {display_date} 三大法人買賣超前10名（全市場，單位：張）")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**外資買超前10名**")
+            df = pd.DataFrame(top10["foreign_buy_top10"])[["name", "code", "foreign_net"]]
+            df["foreign_net"] = (df["foreign_net"] / 1000).round(0)
+            df.columns = ["名稱", "代號", "買超(張)"]
+            st.dataframe(
+                df.style.format({"買超(張)": "{:,.0f}"}).pipe(_apply_cell_style, _style_change, ["買超(張)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+            st.markdown("**投信買超前10名**")
+            df = pd.DataFrame(top10["trust_buy_top10"])[["name", "code", "trust_net"]]
+            df["trust_net"] = (df["trust_net"] / 1000).round(0)
+            df.columns = ["名稱", "代號", "買超(張)"]
+            st.dataframe(
+                df.style.format({"買超(張)": "{:,.0f}"}).pipe(_apply_cell_style, _style_change, ["買超(張)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        with col2:
+            st.markdown("**外資賣超前10名**")
+            df = pd.DataFrame(top10["foreign_sell_top10"])[["name", "code", "foreign_net"]]
+            df["foreign_net"] = (df["foreign_net"] / 1000).round(0)
+            df.columns = ["名稱", "代號", "賣超(張)"]
+            st.dataframe(
+                df.style.format({"賣超(張)": "{:,.0f}"}).pipe(_apply_cell_style, _style_change, ["賣超(張)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+            st.markdown("**投信賣超前10名**")
+            df = pd.DataFrame(top10["trust_sell_top10"])[["name", "code", "trust_net"]]
+            df["trust_net"] = (df["trust_net"] / 1000).round(0)
+            df.columns = ["名稱", "代號", "賣超(張)"]
+            st.dataframe(
+                df.style.format({"賣超(張)": "{:,.0f}"}).pipe(_apply_cell_style, _style_change, ["賣超(張)"]),
+                use_container_width=True, hide_index=True,
+            )
+
+    st.divider()
+    st.subheader("🔁 候選股清單：投信／外資連續買賣超")
+    st.caption("往前抓最近約25個交易日的資料，計算每檔候選股連續買超或連續賣超的天數（中途遇到淨額為0會中斷計算）。")
+
+    with st.spinner("計算連續買賣超天數中...（要抓約25天的資料，會比較慢）"):
+        streaks = _get_institutional_streaks_cached()
+
+    if not streaks:
+        st.error("目前無法取得連續買賣超資料")
+    else:
+        df = pd.DataFrame(streaks)
+        df = df[df["foreign_streak"].gt(0) | df["trust_streak"].gt(0)].copy()
+        df["外資"] = df.apply(
+            lambda r: f"連{r['foreign_streak']}{r['foreign_direction']}" if r["foreign_direction"] else "-", axis=1
+        )
+        df["投信"] = df.apply(
+            lambda r: f"連{r['trust_streak']}{r['trust_direction']}" if r["trust_direction"] else "-", axis=1
+        )
+        df["排序權重"] = df[["foreign_streak", "trust_streak"]].max(axis=1)
+        df = df.sort_values("排序權重", ascending=False)
+        df_display = df[["name", "symbol", "外資", "投信"]]
+        df_display.columns = ["名稱", "代號", "外資連續買賣超", "投信連續買賣超"]
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "「連續買賣超」只計算候選股清單裡的股票（約50檔），不是全市場。三大法人買賣超反映的是籌碼流向，"
+        "不是股價漲跌的保證，法人買超不代表股價一定會漲，僅供輔助參考。"
+    )
 
 st.divider()
 st.caption(
