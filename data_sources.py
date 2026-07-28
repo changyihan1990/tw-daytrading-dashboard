@@ -13,11 +13,12 @@ data_sources.py
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import re
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 try:
@@ -111,6 +112,168 @@ def _taipei_today():
         return datetime.now(ZoneInfo("Asia/Taipei")).date()
     except Exception:
         return datetime.utcnow().date()
+
+
+# ============================================================
+# 三大法人買賣超（證交所 T86 官方報表）
+# ============================================================
+# 資料來源：證交所「三大法人買賣超日報」，這是證交所行之有年、被廣泛使用的官方JSON報表，
+# 涵蓋上市（TWSE）全部股票的外資、投信、自營商買賣超股數，非交易日（假日）查詢會拿不到資料。
+# 注意：這份資料只有「上市」的股票，不含上櫃（TWOII）股票。
+
+T86_URL_TEMPLATE = "https://www.twse.com.tw/fund/T86?response=json&date={date}&selectType=ALLBUT0999"
+
+
+def _parse_int(value):
+    """把T86回傳的字串數字（可能有千分位逗號或負號）轉成int，轉不了就當作0"""
+    try:
+        return int(str(value).replace(",", "").strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fetch_t86_data(date_str):
+    """
+    抓取證交所T86報表某一天的資料。date_str格式為YYYYMMDD。
+    回傳: dict {股票代號: {"code":, "name":, "foreign_net":, "trust_net":}}
+    非交易日、抓取失敗都回傳 None，呼叫端要自行處理。
+    """
+    url = T86_URL_TEMPLATE.format(date=date_str)
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return None
+
+    if payload.get("stat") != "OK" or not payload.get("data"):
+        return None
+
+    result = {}
+    for row in payload["data"]:
+        try:
+            code = str(row[0]).strip()
+            name = str(row[1]).strip()
+            foreign_net = _parse_int(row[4])
+            trust_net = _parse_int(row[10])
+            result[code] = {"code": code, "name": name, "foreign_net": foreign_net, "trust_net": trust_net}
+        except (IndexError, ValueError, TypeError):
+            continue
+
+    return result or None
+
+
+def get_institutional_top10():
+    """
+    抓取最近一個有資料的交易日的三大法人買賣超，計算外資、投信各自的買超前10名與賣超前10名
+    （涵蓋全部上市股票，不限候選清單）。
+
+    回傳: dict，包含 "date"（實際使用的資料日期，YYYYMMDD）與四個排行：
+        foreign_buy_top10 / foreign_sell_top10 / trust_buy_top10 / trust_sell_top10
+    每個排行是 list[dict]，每個 dict 有 code / name / net（股數）。
+    連續多天都抓不到資料（例如遇到連假）就回傳 None。
+    """
+    cursor = _taipei_today()
+    data = None
+    date_str = None
+
+    for _ in range(10):
+        date_str = cursor.strftime("%Y%m%d")
+        data = _fetch_t86_data(date_str)
+        if data:
+            break
+        cursor -= timedelta(days=1)
+
+    if not data:
+        return None
+
+    rows = list(data.values())
+    foreign_sorted = sorted(rows, key=lambda x: x["foreign_net"], reverse=True)
+    trust_sorted = sorted(rows, key=lambda x: x["trust_net"], reverse=True)
+
+    return {
+        "date": date_str,
+        "foreign_buy_top10": foreign_sorted[:10],
+        "foreign_sell_top10": list(reversed(foreign_sorted[-10:])),
+        "trust_buy_top10": trust_sorted[:10],
+        "trust_sell_top10": list(reversed(trust_sorted[-10:])),
+    }
+
+
+def _fetch_recent_t86_days(min_valid_days=25, lookback_calendar_days=40, max_workers=5):
+    """
+    平行抓取最近 lookback_calendar_days 個日曆天的T86資料，過濾掉非交易日（抓不到資料）的天數，
+    回傳由新到舊排序的每日資料 list（最多 min_valid_days 筆）。
+    """
+    today = _taipei_today()
+    date_strs = [(today - timedelta(days=i)).strftime("%Y%m%d") for i in range(lookback_calendar_days)]
+
+    day_results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_fetch_t86_data, d): d for d in date_strs}
+        for future in as_completed(future_map):
+            d = future_map[future]
+            try:
+                day_results[d] = future.result()
+            except Exception:
+                day_results[d] = None
+
+    valid_days = [day_results[d] for d in date_strs if day_results.get(d)]
+    return valid_days[:min_valid_days]
+
+
+def _compute_streak(daily_data, code, field):
+    """
+    daily_data 是由新到舊排序的每日T86資料 list，計算某檔股票在某個欄位（外資或投信淨額）上
+    連續買超或連續賣超的天數，中途遇到淨額為0或抓不到資料就中斷。
+    回傳: (streak_days, direction)，direction 為 "買超"/"賣超"/None
+    """
+    streak = 0
+    direction = None
+    for day in daily_data:
+        info = day.get(code)
+        if info is None:
+            break
+        net = info[field]
+        if net == 0:
+            break
+        this_dir = "買超" if net > 0 else "賣超"
+        if direction is None:
+            direction = this_dir
+            streak = 1
+        elif this_dir == direction:
+            streak += 1
+        else:
+            break
+    return streak, direction
+
+
+def get_institutional_streaks():
+    """
+    針對候選股清單，計算外資、投信各自「連續買超」或「連續賣超」的天數（往前抓最近約25個交易日）。
+
+    回傳: list[dict]，每個 {"name":, "symbol":, "foreign_streak":, "foreign_direction":,
+                          "trust_streak":, "trust_direction":}
+    抓不到任何有效資料回傳空list。
+    """
+    daily_data = _fetch_recent_t86_days()
+    if not daily_data:
+        return []
+
+    results = []
+    for name, symbol in CANDIDATE_UNIVERSE.items():
+        code = symbol.split(".")[0]
+        foreign_streak, foreign_dir = _compute_streak(daily_data, code, "foreign_net")
+        trust_streak, trust_dir = _compute_streak(daily_data, code, "trust_net")
+        results.append({
+            "name": name,
+            "symbol": symbol,
+            "foreign_streak": foreign_streak,
+            "foreign_direction": foreign_dir,
+            "trust_streak": trust_streak,
+            "trust_direction": trust_dir,
+        })
+    return results
 
 
 def _fetch_intraday_single(symbol):
